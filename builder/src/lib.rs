@@ -19,16 +19,21 @@ pub fn derive(input: TokenStream) -> TokenStream {
         _ => panic!("Can only use Builder with named fields in a struct"),
     };
 
+    // TODO: If there is a field that is a vector, this should also be
+    // treated as optional (and simply empty if nothing is given).
+    
     // Original fields & names:
     let mut fields: Vec<(syn::Ident, syn::Type)> = vec![];
     // Fields which wrap Option<...> around each type:
     let mut new_fields: Vec<syn::Field> = vec![];
     // Vector fields which need single-item function; the tuple is
-    // (original field, desired function name):
-    let mut each_fields: Vec<(syn::Ident, String)> = vec![];
+    // (original field, desired function name, type inside vector):
+    let mut each_fields: Vec<(syn::Ident, String, syn::Type)> = vec![];
     // Fields which need a builder function:
     let mut builder_fields: Vec<(syn::Ident, syn::Type)> = vec![];
 
+    let mut errs: Vec<syn::Error> = vec![];
+    
     // Iterate over every field in the struct:
     for f in nf.named {
 
@@ -41,13 +46,22 @@ pub fn derive(input: TokenStream) -> TokenStream {
             let nested = get_metalist_attr(attr, "builder").unwrap_or(Punctuated::new());
             for (k,v) in get_name_val_str(&nested) {
                 if k.to_string() == "each" {
-                    eprintln!("Generating function {} for {}", v, id.to_string());
-                    each_fields.push((id.clone(), v.clone()));
+                    let inner = match get_inner_type(&ty, "Vec") {
+                        Some(inner) => inner,
+                        None => {
+                            println!("Trying to generate function {} for {}, but can't get inner type", v, id.to_string());
+                            continue;
+                        },
+                    };
+                    println!("Generating function {} for {}", v, id.to_string());
+                    each_fields.push((id.clone(), v.clone(), inner.clone()));
                     if id.to_string() == v {
-                        eprintln!("Suppressing normal {} function", v);
+                        println!("Suppressing normal {} function", v);
                         full_builder = false;
                     }
                     break 'outer;
+                } else {
+                    errs.push(syn::Error::new(id.span(), "expected `builder(each = \"...\")`"));
                 }
             }
         }
@@ -62,7 +76,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         // See if this field is already an Option.  If it is,
         // field_opt = the same field.  If not, field_opt = a field
         // with the type wrapped in Option.
-        let field_opt = match is_option_type(&ty) {
+        let field_opt = match get_inner_type(&ty, "Option") {
             Some(_) => f2,
             None => {
                 // Build Foo of Option<Foo>:
@@ -80,7 +94,8 @@ pub fn derive(input: TokenStream) -> TokenStream {
 
                 // Build Option<Foo>:
                 let path_opt: syn::PathSegment = syn::PathSegment {
-                    ident: syn::Ident::new("Option", span),
+                    ident: syn::Ident::new("std::option::Option", span),
+                    // TODO: This won't work for 'ident'
                     arguments: syn::PathArguments::AngleBracketed(args_bkt),
                 };
                 
@@ -114,46 +129,53 @@ pub fn derive(input: TokenStream) -> TokenStream {
     // Iterator of code for builder functions:
     let builder_fns = builder_fields.iter().map(|(id,ty)| {
         // If original field was Option<...>, use its inner type:
-        let ty = is_option_type(ty).unwrap_or(ty);
+        let ty = get_inner_type(ty, "Option").unwrap_or(ty);
         quote! {
             fn #id(&mut self, #id: #ty) -> &mut Self {
-                self.#id = Some(#id);
+                self.#id = std::option::Option::Some(#id);
                 self
             }
         }
     });
 
-    let builder_each_fns = each_fields.iter().map(|(id,fn_name)| {
+    let builder_each_fns = each_fields.iter().map(|(id,fn_name,ty)| {
         let fn_id = syn::Ident::new(fn_name, span);
         quote! {
-            // TODO:
-            // Still need to know type inside of vector.
-            fn #fn_id(&mut self, #fn_id: _) -> &mut Self {
-                self.#id.push(#fn_id);
+            fn #fn_id(&mut self, #fn_id: #ty) -> &mut Self {
+                self.#id.get_or_insert(vec![]).push(#fn_id);
                 self
             }
         }
     });
     
     // Iterator of code for initializing all builder fields to None:
-    let struct_init = fields.iter().map(|(id,_)| quote! { #id: None, });
+    let struct_init = fields.iter().map(|(id,_)| quote! { #id: std::option::Option::None, });
     
     // Iterator of code for field checks in build() function.  Fields
     // like Option<...> are optional and need not be checked.
     let field_checks = fields.iter().map(|(id,ty)| {
         let err_str = format!("Missing {} in builder", id.to_string());
-        match is_option_type(ty) {
+        match get_inner_type(ty, "Option") {
             Some(_) => quote! {
                 #id: self.#id.clone(),
             },
-            None => quote! {
-                #id: self.#id.clone().ok_or(#err_str)?,
-                // TODO: Is .clone() the only option here?
-            }
+            None => match get_inner_type(ty, "Vec") {
+                Some(_) => quote! {
+                    #id: self.#id.clone().unwrap_or(vec![]),
+                },
+                None => quote! {
+                    #id: self.#id.clone().ok_or(#err_str)?,
+                    // TODO: Is .clone() the only option here?
+                },
+            },
         }
     });
+
+    let errs_q = errs.iter().map(syn::Error::to_compile_error);
     
     let q = quote! {
+
+        #(#errs_q);*
 
         pub struct #builder_t {
             #(#new_fields),*
@@ -179,7 +201,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
             }
         }
     };
-    eprintln!("TOKENS: {}", q);
+    println!("TOKENS: {}", q);
     TokenStream::from(q)
 }
 
@@ -240,9 +262,9 @@ fn get_name_val_str(nested: &Punctuated<syn::NestedMeta, Comma>) -> Vec<(&syn::I
     vals
 }
 
-// If the given Type is an Option, then returns its inner type wrapped
-// in Option.  Otherwise, returns None.
-fn is_option_type(ty: &syn::Type) -> Option<&syn::Type> {
+// If the Type matches some outer type (e.g. Option), then returns its
+// inner type wrapped in Option.  Otherwise, returns None.
+fn get_inner_type<S: Into<String>>(ty: &syn::Type, target: S) -> Option<&syn::Type> {
     // Use a very ugly cascade of pattern matches and other checks
     // to filter out anything that is Option<...>:
     let segs = match ty {
@@ -263,7 +285,7 @@ fn is_option_type(ty: &syn::Type) -> Option<&syn::Type> {
                     args: ga, ..
                 }),
         }) => {
-            if id.to_string() != "Option" {
+            if id.to_string() != target.into() {
                 return None;
             }
             if ga.len() != 1 {

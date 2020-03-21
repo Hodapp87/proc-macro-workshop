@@ -42,7 +42,6 @@ pub struct Command {
 }
 
 fn main() {
-    /*
     let command = Command::builder()
         .executable("cargo".to_owned())
         .arg("build".to_owned())
@@ -51,5 +50,4 @@ fn main() {
         .unwrap();
 
     assert_eq!(command.executable, "cargo");
-    */
 }
