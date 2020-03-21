@@ -23,54 +23,39 @@ pub fn derive(input: TokenStream) -> TokenStream {
     let mut fields: Vec<(syn::Ident, syn::Type)> = vec![];
     // Fields which wrap Option<...> around each type:
     let mut new_fields: Vec<syn::Field> = vec![];
+    // Vector fields which need single-item function; the tuple is
+    // (original field, desired function name):
+    let mut each_fields: Vec<(syn::Ident, String)> = vec![];
+    // Fields which need a builder function:
+    let mut builder_fields: Vec<(syn::Ident, syn::Type)> = vec![];
 
     // Iterate over every field in the struct:
     for f in nf.named {
 
-        eprintln!("attribs for f: {}", f.attrs.len());
-        for attr in &f.attrs {
-            let nested = get_metalist_attr(attr, "builder").unwrap_or(Punctuated::new());
-            for nm in nested {
-                match nm {
-                    syn::NestedMeta::Meta(syn::Meta::Path(p)) =>
-                        eprintln!("   got NestedMeta.Path"),
-                    syn::NestedMeta::Meta(syn::Meta::List(ml)) =>
-                        eprintln!("   got NestedMeta.List"),
-                    // 'each' will be here?
-                    syn::NestedMeta::Meta(syn::Meta::NameValue(syn::MetaNameValue {
-                        path: p, lit: l, ..
-                    })) => {
-                        eprintln!("   got NestedMeta.NameValue");
-                        let s = get_single_path(&p.segments).unwrap_or("".to_string());
-                        eprintln!("     path={}", s);
-                        match l {
-                            syn::Lit::Str(l) => eprintln!("     Str {}", l.value()),
-                            syn::Lit::ByteStr(_) => eprintln!("     ByteStr"),
-                            syn::Lit::Byte(_) => eprintln!("     Byte"),
-                            syn::Lit::Char(_) => eprintln!("     Char"),
-                            syn::Lit::Int(_) => eprintln!("     Int"),
-                            syn::Lit::Float(_) => eprintln!("     Float"),
-                            syn::Lit::Bool(_) => eprintln!("     Bool"),
-                            syn::Lit::Verbatim(_) => eprintln!("     Verbatim"),
-                        }
-                    },
-                    syn::NestedMeta::Lit(l) =>
-                        eprintln!("   got NestedMeta.Lit"),
-                }
-            };
-        }
-        
         fields.push((f.ident.clone().unwrap(), f.ty.clone()));
         let id = f.ident.clone().unwrap();
         let ty = f.ty.clone();
-        let t = quote! {
-            fn #id(&mut self, #id #ty) -> &mut self {
-                self.#id = Some(#id);
-                self
-            }
-        };
-        eprintln!("tokens for t: {}", t);
 
+        let mut full_builder = true;
+        'outer: for attr in &f.attrs {
+            let nested = get_metalist_attr(attr, "builder").unwrap_or(Punctuated::new());
+            for (k,v) in get_name_val_str(&nested) {
+                if k.to_string() == "each" {
+                    eprintln!("Generating function {} for {}", v, id.to_string());
+                    each_fields.push((id.clone(), v.clone()));
+                    if id.to_string() == v {
+                        eprintln!("Suppressing normal {} function", v);
+                        full_builder = false;
+                    }
+                    break 'outer;
+                }
+            }
+        }
+
+        if full_builder {
+            builder_fields.push((f.ident.clone().unwrap(), f.ty.clone()));
+        }
+        
         // Make a mutable copy and scrub out attributes:
         let mut f2 = f.clone();
         f2.attrs = vec![];
@@ -127,7 +112,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         &(main_t.to_string() + "Builder"), span);
     
     // Iterator of code for builder functions:
-    let builder_fns = fields.iter().map(|(id,ty)| {
+    let builder_fns = builder_fields.iter().map(|(id,ty)| {
         // If original field was Option<...>, use its inner type:
         let ty = is_option_type(ty).unwrap_or(ty);
         quote! {
@@ -137,6 +122,19 @@ pub fn derive(input: TokenStream) -> TokenStream {
             }
         }
     });
+
+    let builder_each_fns = each_fields.iter().map(|(id,fn_name)| {
+        let fn_id = syn::Ident::new(fn_name, span);
+        quote! {
+            // TODO:
+            // Still need to know type inside of vector.
+            fn #fn_id(&mut self, #fn_id: _) -> &mut Self {
+                self.#id.push(#fn_id);
+                self
+            }
+        }
+    });
+    
     // Iterator of code for initializing all builder fields to None:
     let struct_init = fields.iter().map(|(id,_)| quote! { #id: None, });
     
@@ -163,6 +161,7 @@ pub fn derive(input: TokenStream) -> TokenStream {
         
         impl #builder_t {
             #(#builder_fns)*
+            #(#builder_each_fns)*
             pub fn build(&mut self) -> Result<#main_t, Box<dyn std::error::Error>> {
 
                 let r = #main_t {
@@ -184,15 +183,15 @@ pub fn derive(input: TokenStream) -> TokenStream {
     TokenStream::from(q)
 }
 
-fn get_single_path(segments: &Punctuated<syn::PathSegment, Colon2>) -> Option<String> {
+fn get_single_path(segments: &Punctuated<syn::PathSegment, Colon2>) -> Option<&syn::Ident> {
     if segments.len() != 1 {
         return None;
     }
     match segments.first() {
         Some(syn::PathSegment {
-            ident: id,
+            ident,
             arguments: syn::PathArguments::None,
-        }) => Some(id.to_string()),
+        }) => Some(ident),
         _ => None,
     }
 }
@@ -200,7 +199,7 @@ fn get_single_path(segments: &Punctuated<syn::PathSegment, Colon2>) -> Option<St
 fn get_metalist_attr(attr: &syn::Attribute, target_path: &str) -> Option<Punctuated<syn::NestedMeta, Comma>> {
     let (segs, nested) = match attr.parse_meta() {
         Ok(syn::Meta::List(syn::MetaList {
-            path: syn::Path { segments: segs, .. }, nested: nested, ..
+            path: syn::Path { segments: segs, .. }, nested, ..
         })) => (segs, nested.clone()),
         _ => return None,
     };
@@ -209,16 +208,36 @@ fn get_metalist_attr(attr: &syn::Attribute, target_path: &str) -> Option<Punctua
     }
     let id = match segs.first() {
         Some(syn::PathSegment {
-            ident: id,
+            ident,
             arguments: syn::PathArguments::None,
-        }) => id,
+        }) => ident,
         _ => return None,
     };
     if id.to_string() != target_path {
         return None;
     }
-    //eprintln!("   Matched target {}!", target);
-    return Some(nested);
+
+    Some(nested)
+}
+
+fn get_name_val_str(nested: &Punctuated<syn::NestedMeta, Comma>) -> Vec<(&syn::Ident, String)> {
+    let mut vals: Vec<(&syn::Ident, String)> = vec![];
+    for nm in nested {
+        match nm {
+            syn::NestedMeta::Meta(syn::Meta::NameValue(syn::MetaNameValue {
+                path, lit, ..
+            })) => {
+                match (get_single_path(&path.segments), lit) {
+                    (Some(id), syn::Lit::Str(lit)) => {
+                        vals.push((id, lit.value()));
+                    },
+                    _ => (),
+                }
+            },
+            _ => (),
+        }
+    }
+    vals
 }
 
 // If the given Type is an Option, then returns its inner type wrapped
@@ -245,10 +264,8 @@ fn is_option_type(ty: &syn::Type) -> Option<&syn::Type> {
                 }),
         }) => {
             if id.to_string() != "Option" {
-                eprintln!("Rejected ID: {}", id.to_string());
                 return None;
             }
-            eprintln!("Using ID: {}", id.to_string());
             if ga.len() != 1 {
                 return None
             }
