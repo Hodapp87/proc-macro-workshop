@@ -6,20 +6,6 @@ use syn::{Fields};
 use syn::punctuated::{Punctuated};
 use syn::token::{Comma, Colon2};
 
-/*
-#[proc_macro_attribute]
-pub fn builder(attr: TokenStream, item: TokenStream) -> TokenStream {
-    item
-}
-*/
-
-// TODO: Still stuck at:
-// "error[E0658]: The attribute `builder` is currently unknown to the
-// compiler and may have meaning added to it in the future"
-//
-// The macro *output*, not the input, is the problem.  I need to scrub
-// the attribs out of the fields.
-
 #[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: TokenStream) -> TokenStream {
     // TODO: where is it made clear the output type of parse_macro_input?
@@ -41,6 +27,39 @@ pub fn derive(input: TokenStream) -> TokenStream {
     // Iterate over every field in the struct:
     for f in nf.named {
 
+        eprintln!("attribs for f: {}", f.attrs.len());
+        for attr in &f.attrs {
+            let nested = get_metalist_attr(attr, "builder").unwrap_or(Punctuated::new());
+            for nm in nested {
+                match nm {
+                    syn::NestedMeta::Meta(syn::Meta::Path(p)) =>
+                        eprintln!("   got NestedMeta.Path"),
+                    syn::NestedMeta::Meta(syn::Meta::List(ml)) =>
+                        eprintln!("   got NestedMeta.List"),
+                    // 'each' will be here?
+                    syn::NestedMeta::Meta(syn::Meta::NameValue(syn::MetaNameValue {
+                        path: p, lit: l, ..
+                    })) => {
+                        eprintln!("   got NestedMeta.NameValue");
+                        let s = get_single_path(&p.segments).unwrap_or("".to_string());
+                        eprintln!("     path={}", s);
+                        match l {
+                            syn::Lit::Str(l) => eprintln!("     Str {}", l.value()),
+                            syn::Lit::ByteStr(_) => eprintln!("     ByteStr"),
+                            syn::Lit::Byte(_) => eprintln!("     Byte"),
+                            syn::Lit::Char(_) => eprintln!("     Char"),
+                            syn::Lit::Int(_) => eprintln!("     Int"),
+                            syn::Lit::Float(_) => eprintln!("     Float"),
+                            syn::Lit::Bool(_) => eprintln!("     Bool"),
+                            syn::Lit::Verbatim(_) => eprintln!("     Verbatim"),
+                        }
+                    },
+                    syn::NestedMeta::Lit(l) =>
+                        eprintln!("   got NestedMeta.Lit"),
+                }
+            };
+        }
+        
         fields.push((f.ident.clone().unwrap(), f.ty.clone()));
         let id = f.ident.clone().unwrap();
         let ty = f.ty.clone();
@@ -52,11 +71,14 @@ pub fn derive(input: TokenStream) -> TokenStream {
         };
         eprintln!("tokens for t: {}", t);
 
+        // Make a mutable copy and scrub out attributes:
+        let mut f2 = f.clone();
+        f2.attrs = vec![];
         // See if this field is already an Option.  If it is,
         // field_opt = the same field.  If not, field_opt = a field
         // with the type wrapped in Option.
         let field_opt = match is_option_type(&ty) {
-            Some(_) => f.clone(),
+            Some(_) => f2,
             None => {
                 // Build Foo of Option<Foo>:
                 let mut args: Punctuated<syn::GenericArgument, Comma> = Punctuated::new();
@@ -88,14 +110,12 @@ pub fn derive(input: TokenStream) -> TokenStream {
                     },
                 };
 
-                // Finally, build a field (by copying the old one and
-                // swapping out the type):
-                let mut f_opt: syn::Field = f.clone();
-                f_opt.ty = syn::Type::Path(tp_opt);
-                f_opt
+                // Finally, swap out type in our copy of the field:
+                f2.ty = syn::Type::Path(tp_opt);
+                f2
             },
         };
-        
+
         new_fields.push(field_opt);
     }
 
@@ -162,6 +182,43 @@ pub fn derive(input: TokenStream) -> TokenStream {
     };
     eprintln!("TOKENS: {}", q);
     TokenStream::from(q)
+}
+
+fn get_single_path(segments: &Punctuated<syn::PathSegment, Colon2>) -> Option<String> {
+    if segments.len() != 1 {
+        return None;
+    }
+    match segments.first() {
+        Some(syn::PathSegment {
+            ident: id,
+            arguments: syn::PathArguments::None,
+        }) => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+fn get_metalist_attr(attr: &syn::Attribute, target_path: &str) -> Option<Punctuated<syn::NestedMeta, Comma>> {
+    let (segs, nested) = match attr.parse_meta() {
+        Ok(syn::Meta::List(syn::MetaList {
+            path: syn::Path { segments: segs, .. }, nested: nested, ..
+        })) => (segs, nested.clone()),
+        _ => return None,
+    };
+    if segs.len() != 1 {
+        return None;
+    }
+    let id = match segs.first() {
+        Some(syn::PathSegment {
+            ident: id,
+            arguments: syn::PathArguments::None,
+        }) => id,
+        _ => return None,
+    };
+    if id.to_string() != target_path {
+        return None;
+    }
+    //eprintln!("   Matched target {}!", target);
+    return Some(nested);
 }
 
 // If the given Type is an Option, then returns its inner type wrapped
